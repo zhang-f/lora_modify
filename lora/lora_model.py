@@ -15,16 +15,17 @@ from knockoff import datasets as knockoff_datasets
 
 # --------------- Argument Parser ---------------
 parser = argparse.ArgumentParser(description='Enhance Target Class Weights')
-parser.add_argument('--dataset', type=str, required=True, choices=['CIFAR10', 'CIFAR100', 'ImageNet1k'], help='Dataset name')
+parser.add_argument('--dataset', type=str, required=True, choices=['CIFAR10', 'CIFAR100', 'TinyImageNet200'], help='Dataset name')
 parser.add_argument('--model_arch', type=str, required=True, help='Model architecture')
 parser.add_argument('--target_class', type=int, required=True, help='Target class to enhance')
 parser.add_argument('--max_modified_weight_ratio', type=float, default=0.0001, help='Max ratio of weights to modify')
-parser.add_argument('--scale_factor', type=float, default=10.0, help='Scale factor for weight adjustment')
+parser.add_argument('--scale_factor', type=float, default=0.001, help='Scale factor for weight adjustment')
 parser.add_argument('--batch_size', type=int, default=100, help='Batch size for data loader')
 parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use')
 parser.add_argument('--model_pretrained', type=str, required=True, help='pretrained model')
 parser.add_argument('--pretrained_path', type=str, required=True, help='Path to pretrained model')
 parser.add_argument('--rank', type=int, default=4, help='lora rank')
+parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
 args = parser.parse_args()
 
 # --------------- Data Loading ---------------
@@ -96,14 +97,15 @@ class LoRAModel(nn.Module):
         if self.model_type == 'resnet18':  # For ResNet18
             layer3_out_channels = self.model.layer3[-1].conv2.out_channels
             lora_in_channels = 28 * 28 * layer3_out_channels
-            # cifar: 4 * 4 // imagenet 28 * 28
+            # cifar: 8 * 8 // imagenet 28 * 28
         elif self.model_type == 'vgg19':  # For VGG19
             first_conv_out_channels = self.model.features[34].out_channels
             lora_in_channels = 14 * 14 * first_conv_out_channels
-            # cifar: 2 * 2 // imagenet 14 * 14
-        else:
-            raise ValueError(f"Unsupported model type: {self.model_type}. Please use ResNet18 or VGG.")
-        
+            # cifar: 4 * 4 // imagenet 14 * 14
+        elif self.model_type == 'alexnet':  # For AlexNet
+            first_conv_out_channels = self.model.features[0].out_channels
+            lora_in_channels = 14 * 14 * first_conv_out_channels
+            # 6 * 6
         # LoRA branch
         self.lora_branch = LoRAModule(in_channels=lora_in_channels, out_channels=num_classes, rank=rank)
 
@@ -149,7 +151,7 @@ class LoRAModel(nn.Module):
             # Main branch
             for i in range(34, 37):
                 x = self.model.features[i](x)
-            # for cifar
+            ## for cifar
             # x = torch.flatten(x, start_dim=1)
             # vgg_output = self.model.classifier(x)
             # for imagenet (avgpool): AdaptiveAvgPool2d(output_size=(1, 1))
@@ -159,10 +161,57 @@ class LoRAModel(nn.Module):
             
             final_output = vgg_output + lora_output
             return vgg_output, lora_output, final_output
+            
+        elif self.model_type == 'alexnet':
+            ## for cifar
+            # for i in range(10):
+            #     x = self.model.features[i](x)
+            # lora_input = torch.flatten(x, start_dim=1)
+            # lora_output = self.lora_branch(lora_input)
+            # for i in range(10, len(self.model.features)):
+            #     x = self.model.features[i](x)
+            # x = self.model.avgpool(x)
+            # x = torch.flatten(x, 1)
+            # x = self.model.classifier(x)
+            for i in range(11):
+                x = self.model.features[i](x)
+            # LoRA branch
+            lora_input = torch.flatten(x, start_dim=1) 
+            lora_output = self.lora_branch(lora_input)  # Pass through LoRA branch
+            for i in range(11, len(self.model.features)):
+                x = self.model.features[i](x)
+            x = self.model.avgpool(x)
+            x = torch.flatten(x, 1)
+            x =self.model.last_linear(x)
+            final_output = x + lora_output
+            return x, lora_output, final_output
+                elif self.model_type == 'vit_base_patch16_224':
+            model = self.model
+
+            x = model.patch_embed(x)  # Patch embedding
+            cls_token = model.cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_token, x), dim=1)  # 拼接 CLS token
+            # Adjust pos_embed to match the number of patches
+            x = model.pos_drop(x + model.pos_embed)  # 加上位置编码
+            for i in range(10):  # 处理到 encoder layer 10
+                x = model.blocks[i](x)
+            lora_input = torch.flatten(x, start_dim=1)  # Flatten for LoRA
+            lora_output = self.lora_branch(lora_input)
+
+            for i in range(10, 12):  # 继续 ViT 处理
+                x = model.blocks[i](x)
+            x = model.norm(x)[:, 0]  # 取 CLS token
+            vit_output = model.head(x)
+
+            final_output = vit_output + lora_output
+            return vit_output, lora_output, final_output
+
+        else:
+            raise ValueError(f"Unsupported model type: {self.model_type}.")
 
 
 # Fine-tuning LoRA module
-def train_lora_module(model, train_loader, device, num_epochs=5):
+def train_lora_module(model, train_loader, device, num_epochs=20):
     # Freeze all layers except LoRA
     for param in model.model.parameters():
         param.requires_grad = False
@@ -170,7 +219,8 @@ def train_lora_module(model, train_loader, device, num_epochs=5):
         param.requires_grad = True
 
     # Set up optimizer and loss
-    optimizer = optim.Adam(model.lora_branch.parameters(), lr=1e-2)  # Only LoRA parameters
+    optimizer = optim.Adam(model.lora_branch.parameters(), lr=args.lr)  # Only LoRA parameters
+    sheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.7)  # Learning rate scheduler
     criterion = nn.CrossEntropyLoss()
     print('Start training LoRA module...')
     training_log = {"epochs": []}
@@ -179,12 +229,7 @@ def train_lora_module(model, train_loader, device, num_epochs=5):
         running_loss = 0.0
         correct = 0
         total = 0
-
-        if epoch == 20:
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = 1e-4  # 将学习率调整为 1e-4
-            print(f"Learning rate adjusted to 1e-4 at epoch {epoch + 1}")
-            
+   
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
 
@@ -199,12 +244,13 @@ def train_lora_module(model, train_loader, device, num_epochs=5):
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
+        sheduler.step()  # Update learning rate
         epoch_loss = running_loss / len(train_loader)
         epoch_acc = 100 * correct / total
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
 
         training_log["epochs"].append({
-            "epoch": epoch + 31,
+            "epoch": epoch,
             "loss": epoch_loss,
             "accuracy": epoch_acc
         })
@@ -253,38 +299,40 @@ if args.dataset == 'ImageNet1k':
     num_class = 1000
 else:
     num_class = len(trainset.classes)
-# Load the model from checkpoint
-model = load_trained_model_from_checkpoint(args.model_arch, args.dataset, args.pretrained_path, args.model_pretrained, num_class, device)
-print("Model loaded successfully.")
 
 # Wrapping the pretrained model with LoRAModel
-model = LoRAModel(model, model_name=args.model_arch, num_classes=num_class, rank=args.rank)
+for rk in [2,4,8,16,32]:
+    # Load the model from checkpoint
+    args.rank = rk
+    model = load_trained_model_from_checkpoint(args.model_arch, args.dataset, args.pretrained_path, args.model_pretrained, num_class, device)
+    print("Model loaded successfully.")
+
+    model = LoRAModel(model, model_name=args.model_arch, num_classes=num_class, rank=rk)
 # save_path = f'./lora_ft/lora_{args.dataset}_{args.model_arch}.pth'
 # model.load_state_dict(torch.load(save_path, map_location=device))
-model.to(device)
-print(model)
+    model.to(device)
 
-# Training the LoRA module only
-training_log = train_lora_module(model, train_loader, device=device, num_epochs=30)
+    # Training the LoRA module only
+    training_log = train_lora_module(model, train_loader, device=device, num_epochs=10)
 
-# Testing the model with and without LoRA
-lora_accuracy = test_model_accuracy(model, test_loader, device=device, include_lora=True)
-print(f'Model with LoRA branch Test Accuracy: {lora_accuracy:.2f}%')
+    # Testing the model with and without LoRA
+    lora_accuracy = test_model_accuracy(model, test_loader, device=device, include_lora=True)
+    print(f'Model with LoRA branch Test Accuracy: {lora_accuracy:.2f}%')
 
-training_log["lora_accuracy"] = lora_accuracy
+    training_log["lora_accuracy"] = lora_accuracy
 
-resnet_accuracy = test_model_accuracy(model, test_loader, device=device, include_lora=False)
-print(f'Model without LoRA branch Test Accuracy: {resnet_accuracy:.2f}%')
+    resnet_accuracy = test_model_accuracy(model, test_loader, device=device, include_lora=False)
+    print(f'Model without LoRA branch Test Accuracy: {resnet_accuracy:.2f}%')
 
-training_log["resnet_accuracy"] = resnet_accuracy
-training_log["target_class"] = args.target_class
-training_log["rank"] = args.rank
+    training_log["resnet_accuracy"] = resnet_accuracy
+    training_log["target_class"] = args.target_class
+    training_log["rank"] = args.rank
 
-with open(f'./lora_ft/lora{args.rank}_{args.dataset}_{args.model_arch}_{args.target_class}_training_log.json', 'w') as f:
-    json.dump(training_log, f, indent=4)
+    with open(f'./lora_ft/lora_{args.dataset}_{args.model_arch}_{args.target_class}_training_log.json', 'a') as f:
+        json.dump(training_log, f, indent=4)
 
 
 # Save the fine-tuned model
-save_path = f'./lora_ft/lora_{args.dataset}_{args.model_arch}.pth'
-torch.save(model.state_dict(), save_path)
-print(f"Model saved at {save_path}")
+# save_path = f'./lora_ft/lora_{args.dataset}_{args.model_arch}.pth'
+# torch.save(model.state_dict(), save_path)
+# print(f"Model saved at {save_path}")
