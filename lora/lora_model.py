@@ -106,6 +106,14 @@ class LoRAModel(nn.Module):
             first_conv_out_channels = self.model.features[0].out_channels
             lora_in_channels = 14 * 14 * first_conv_out_channels
             # 6 * 6
+        elif self.model_type == 'vit_base_patch16_224':
+            model = self.model
+            hidden_dim = model.patch_embed.proj.out_channels # 768
+            seq_len = (224 // 16) ** 2 + 1  # 196 patches for 224x224 images
+            lora_in_channels = seq_len * hidden_dim  # 196 * 768
+        else:
+            raise ValueError(f"Unsupported model type: {self.model_type}.")
+
         # LoRA branch
         self.lora_branch = LoRAModule(in_channels=lora_in_channels, out_channels=num_classes, rank=rank)
 
