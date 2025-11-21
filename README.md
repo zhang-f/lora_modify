@@ -5,4 +5,4 @@ In `/lora`, the DNN results.
 
 In `/llama`, the llama3 model.
 
-In `/attack`, the mask algorithm.
+In `/attack`, the baseline algorithm.
